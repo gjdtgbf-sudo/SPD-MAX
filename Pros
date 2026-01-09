@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+SPD/UNISOC Tool with GUI - يدعم بروتوكولي BROM البسيط وHDLC
+Author: yousef ekramy
+Version: 2.5 Final - Task Process & Sectioned Structure
+"""
+
+import os
+import sys
+import time
+import struct
+import binascii
+from datetime import datetime
+from enum import IntEnum
+from typing import Optional, Tuple, Dict, List, Any, Callable
+
+# USB related imports
+import usb.core
+import usb.util
+
+# PySide6 Imports
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QListWidget, QTabWidget, QLabel,
+    QMessageBox, QDialog, QSvgWidget, QCheckBox, QGroupBox, QTableWidget,
+    QTableWidgetItem, QHeaderView, QSplitter, QFrame, QScrollArea,
+    QProgressBar
+)
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QObject
+from PySide6.QtGui import QFont, QColor
+
+# ==============================================================================
+# SECTION 1: CONSTANTS & CONFIGURATION
+# ==============================================================================
+VID = 0x1782
+PID = 0x4D00
+
+EP_OUT = 0x01
+EP_IN = 0x81
+CHUNK_SIZE = 0x400
+
+# File Paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VOLCANO_DIR = os.path.join(BASE_DIR, "volcano")
+if not os.path.exists(VOLCANO_DIR):
+    try:
+        os.makedirs(VOLCANO_DIR)
+    except OSError as e:
+        print(f"Warning: Could not create volcano directory: {e}")
+
+FDL1_PATH = os.path.join(VOLCANO_DIR, "FDL1.bin")
+FDL2_PATH = os.path.join(VOLCANO_DIR, "FDL2.bin")
+
+# ==============================================================================
+# SECTION 2: DATA CLASSES (PACKETS)
+# ==============================================================================
+class RebootPackets:
+    """تخزين حزم USB الـ Hex الخاصة بإعادة تشغيل الجهاز"""
+    
+    REBOOT_PACKETS = {
+        "soft_reboot": bytes.fromhex("42 31 00 00"),
+        "exit_fdl": bytes.fromhex("42 32 00 00"),
+        "power_off": bytes.fromhex("42 33 00 00"),
+        "reboot_edl": bytes.fromhex("42 34 00 00"),
+        "reboot_fastboot": bytes.fromhex("42 35 00 00"),
+        "reboot_recovery": bytes.fromhex("42 36 00 00"),
+        "reboot_android": bytes.fromhex("42 37 00 00"),
+    }
+    
+    ADDITIONAL_REBOOT_PACKETS = {
+        "emergency_reboot": bytes.fromhex("7E 01 00 00 00 00 00 00 00 00 7E"),
+        "force_reboot": bytes.fromhex("7E FF FF FF FF 00 00 00 00 00 7E"),
+        "bootloader_unlock": bytes.fromhex("42 55 00 00"),
+        "bootloader_lock": bytes.fromhex("42 4C 00 00"),
+    }
+    
+    UNISOC_SPECIFIC_PACKETS = {
+        "unisoc_watchdog_reset": bytes.fromhex("57 44 4F 47 00 00 00 00"),
+        "unisoc_hard_reset": bytes.fromhex("48 52 53 54 00 00 00 00"),
+        "unisoc_system_reset": bytes.fromhex("53 52 53 54 00 00 00 00"),
+        "unisoc_cpu_reset": bytes.fromhex("43 50 55 52 00 00 00 00"),
+    }
+    
+    HDLC_REBOOT_PACKETS = {
+        "hdlc_reset": bytes.fromhex("7E 04 00 00 00 00 00 00 00 00 7E"),
+        "hdlc_reboot_cmd": bytes.fromhex("7E 04 01 00 00 00 00 00 00 00 7E"),
+        "hdlc_shutdown": bytes.fromhex("7E 04 02 00 00 00 00 00 00 00 7E"),
+    }
+    
+    @classmethod
+    def get_all_packets(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "أوامر إعادة التشغيل الأساسية": {
+                "soft_reboot": {
+                    "hex": "42 31 00 00",
+                    "description": "إعادة تشغيل ناعمة (Soft Reboot)",
+                    "command": 0xB1,
+                    "usage": "الأكثر استخداماً لإعادة التشغيل الآمن"
+                },
+                "exit_fdl": {
+                    "hex": "42 32 00 00",
+                    "description": "الخروج من وضع FDL",
+                    "command": 0xB2,
+                    "usage": "يستخدم قبل إعادة التشغيل للخروج من وضع المبرمج"
+                },
+                "power_off": {
+                    "hex": "42 33 00 00",
+                    "description": "إيقاف التشغيل الكامل",
+                    "command": 0xB3,
+                    "usage": "إيقاف الطاقة بالكامل"
+                },
+            },
+            "أوامر إعادة التشغيل المتقدمة": {
+                "reboot_edl": {
+                    "hex": "42 34 00 00",
+                    "description": "إعادة التشغيل إلى وضع EDL",
+                    "command": 0xB4,
+                    "usage": "للدخول إلى وضع التحميل الطاريء"
+                },
+                "reboot_fastboot": {
+                    "hex": "42 35 00 00",
+                    "description": "إعادة التشغيل إلى Fastboot",
+                    "command": 0xB5,
+                    "usage": "للدخول إلى وضع Fastboot"
+                },
+                "reboot_recovery": {
+                    "hex": "42 36 00 00",
+                    "description": "إعادة التشغيل إلى Recovery",
+                    "command": 0xB6,
+                    "usage": "للدخول إلى وضع الاسترداد"
+                },
+                "reboot_android": {
+                    "hex": "42 37 00 00",
+                    "description": "إعادة التشغيل إلى Android",
+                    "command": 0xB7,
+                    "usage": "للدخول إلى النظام الرئيسي"
+                },
+            },
+            "حزم UNISOC الخاصة": {
+                "unisoc_watchdog_reset": {
+                    "hex": "57 44 4F 47 00 00 00 00",
+                    "description": "إعادة تعيين Watchdog",
+                    "command": "WDOG",
+                    "usage": "تفعيل Watchdog لإعادة التشغيل القسري"
+                },
+                "unisoc_hard_reset": {
+                    "hex": "48 52 53 54 00 00 00 00",
+                    "description": "إعادة تعيين صلبة (Hard Reset)",
+                    "command": "HRST",
+                    "usage": "إعادة تعيين كاملة للمعالج"
+                },
+                "unisoc_system_reset": {
+                    "hex": "53 52 53 54 00 00 00 00",
+                    "description": "إعادة تعيين النظام (System Reset)",
+                    "command": "SRST",
+                    "usage": "إعادة تشغيل النظام"
+                },
+                "unisoc_cpu_reset": {
+                    "hex": "43 50 55 52 00 00 00 00",
+                    "description": "إعادة تعيين المعالج (CPU Reset)",
+                    "command": "CPUR",
+                    "usage": "إعادة تشغيل المعالج فقط"
+                },
+            },
+            "حزم HDLC": {
+                "hdlc_reset": {
+                    "hex": "7E 04 00 00 00 00 00 00 00 00 7E",
+                    "description": "إعادة تعيين HDLC",
+                    "command": 0x04,
+                    "usage": "لبروتوكول HDLC المتقدم"
+                },
+                "hdlc_reboot_cmd": {
+                    "hex": "7E 04 01 00 00 00 00 00 00 00 7E",
+                    "description": "أمر إعادة تشغيل HDLC",
+                    "command": "0x04_01",
+                    "usage": "أمر إعادة تشغيل خاص بـ HDLC"
+                },
+                "hdlc_shutdown": {
+                    "hex": "7E 04 02 00 00 00 00 00 00 00 7E",
+                    "description": "إيقاف التشغيل HDLC",
+                    "command": "0x04_02",
+                    "usage": "إيقاف عبر بروتوكول HDLC"
+                },
+            }
+        }
+    
+    @classmethod
+    def get_packet_bytes(cls, packet_name: str) -> bytes:
+        all_packets = {}
+        all_packets.update(cls.REBOOT_PACKETS)
+        all_packets.update(cls.ADDITIONAL_REBOOT_PACKETS)
+        all_packets.update(cls.UNISOC_SPECIFIC_PACKETS)
+        all_packets.update(cls.HDLC_REBOOT_PACKETS)
+        return all_packets.get(packet_name, b"")
+
+    @classmethod
+    def send_reboot_packet(cls, dev, packet_name: str, usb_obj) -> bool:
+        try:
+            packet_data = cls.get_packet_bytes(packet_name)
+            if not packet_data:
+                return False
+            usb_obj.write(dev, packet_data)
+            time.sleep(0.1)
+            response = usb_obj.read(dev, 64, timeout=1000)
+            return True
+        except Exception as e:
+            print(f"خطأ في إرسال حزمة {packet_name}: {e}")
+            return False
+
+# ==============================================================================
+# SECTION 3: HDLC PROTOCOL
+# ==============================================================================
+class HDLCProtocol:
+    HDLC_FLAG = 0x7E
+    HDLC_ESCAPE = 0x7D
+    HDLC_ESCAPE_MASK = 0x20
+    HDLC_DATA_MAX_SIZE = 512
+    HDLC_FRAME_MIN_SIZE = 8
+    HDLC_FRAME_MAX_SIZE = HDLC_FRAME_MIN_SIZE + HDLC_DATA_MAX_SIZE
+    
+    class CMD(IntEnum):
+        REQ_CONNECT = 0x00
+        REQ_START_DATA = 0x01
+        REQ_MIDST_DATA = 0x02
+        REQ_END_DATA = 0x03
+        REQ_EXEC_DATA = 0x04
+        REQ_RESET = 0x05
+        REQ_SHUTDOWN = 0x06
+        REP_ACK = 0x80
+        REP_VER = 0x81
+    
+    @staticmethod
+    def hdlc_crc(data: bytes, offset: int, length: int) -> int:
+        CRC_16_L_SEED = 0x80
+        CRC_16_L_POLYNOMIAL = 0x8000
+        CRC_16_POLYNOMIAL = 0x1021
+        crc = 0
+        for i in range(offset, offset + length):
+            for j in range(CRC_16_L_SEED, 0, -1):
+                if (crc & CRC_16_L_POLYNOMIAL) != 0:
+                    crc = ((crc << 1) & 0xFFFF) ^ CRC_16_POLYNOMIAL
+                else:
+                    crc = (crc << 1) & 0xFFFF
+                if (data[i] & j) != 0:
+                    crc ^= CRC_16_POLYNOMIAL
+        return crc
+    
+    @classmethod
+    def encode_frame(cls, cmd: int, data: bytes = None) -> bytes:
+        data_length = len(data) if data else 0
+        if data_length > cls.HDLC_DATA_MAX_SIZE:
+            raise ValueError(f"البيانات كبيرة جداً: {data_length}")
+        frame = bytearray(cls.HDLC_FRAME_MIN_SIZE + data_length)
+        frame[0] = cls.HDLC_FLAG
+        frame[1] = (cmd >> 8) & 0xFF
+        frame[2] = cmd & 0xFF
+        frame[3] = (data_length >> 8) & 0xFF
+        frame[4] = data_length & 0xFF
+        if data:
+            frame[5:5+data_length] = data
+        crc = cls.hdlc_crc(frame, 1, 4 + data_length)
+        frame[5+data_length] = (crc >> 8) & 0xFF
+        frame[6+data_length] = crc & 0xFF
+        frame[7+data_length] = cls.HDLC_FLAG
+        escaped = bytearray()
+        escaped.append(cls.HDLC_FLAG)
+        for i in range(1, 7 + data_length):
+            b = frame[i]
+            if b in (cls.HDLC_FLAG, cls.HDLC_ESCAPE):
+                escaped.append(cls.HDLC_ESCAPE)
+                escaped.append(b ^ cls.HDLC_ESCAPE_MASK)
+            else:
+                escaped.append(b)
+        escaped.append(cls.HDLC_FLAG)
+        return bytes(escaped)
+    
+    @classmethod
+    def decode_frame(cls, raw_data: bytes) -> Tuple[int, Optional[bytes]]:
+        if len(raw_data) < 2 or raw_data[0] != cls.HDLC_FLAG or raw_data[-1] != cls.HDLC_FLAG:
+            raise ValueError("إطار HDLC غير صالح")
+        unescaped = bytearray()
+        i = 1
+        while i < len(raw_data) - 1:
+            b = raw_data[i]
+            if b == cls.HDLC_ESCAPE:
+                i += 1
+                if i >= len(raw_data) - 1:
+                    raise ValueError("تسلسل الهروب غير مكتمل")
+                unescaped.append(raw_data[i] ^ cls.HDLC_ESCAPE_MASK)
+            else:
+                unescaped.append(b)
+            i += 1
+        if len(unescaped) < 6:
+            raise ValueError("الإطار قصير جداً")
+        cmd = (unescaped[0] << 8) | unescaped[1]
+        data_length = (unescaped[2] << 8) | unescaped[3]
+        if len(unescaped) != 4 + data_length + 2:
+            raise ValueError(f"عدم تطابق الطول")
+        data = bytes(unescaped[4:4+data_length]) if data_length > 0 else None
+        crc_received = (unescaped[4+data_length] << 8) | unescaped[4+data_length+1]
+        crc_calculated = cls.hdlc_crc(unescaped, 0, 4 + data_length)
+        if crc_received != crc_calculated:
+            raise ValueError(f"CRC غير متطابق")
+        return cmd, data
+
+# ==============================================================================
+# SECTION 4: USB ENGINE (CORE)
+# ==============================================================================
+class UnisocUSB:
+    """Low‑level USB functions for UNISOC BROM/FDL mode with HDLC support"""
+    
+    def __init__(self, use_hdlc: bool = False):
+        self.use_hdlc = use_hdlc
+        self.hdlc = HDLCProtocol() if use_hdlc else None
+    
+    @staticmethod
+    def find_device():
+        return usb.core.find(idVendor=VID, idProduct=PID)
+    
+    @staticmethod
+    def connect(dev=None):
+        if dev is None:
+            dev = UnisocUSB.find_device()
+        if dev is None:
+            return None
+        try:
+            for cfg in dev:
+                for intf in cfg:
+                    if dev.is_kernel_driver_active(intf.bInterfaceNumber):
+                        try:
+                            dev.detach_kernel_driver(intf.bInterfaceNumber)
+                        except usb.core.USBError:
+                            pass
+            dev.set_configuration()
+            usb.util.claim_interface(dev, 0)
+        except usb.core.USBError as e:
+            print(f"USB Connect Error: {e}")
+            return None
+        return dev
+    
+    def write(self, dev, data):
+        try:
+            if dev:
+                dev.write(EP_OUT, data)
+        except usb.core.USBError as e:
+            print(f"USB Write Error: {e}")
+            raise
+
+    def read(self, dev, size=64, timeout=5000):
+        try:
+            if dev:
+                return dev.read(EP_IN, size, timeout=timeout)
+        except usb.core.USBError as e:
+            if e.errno == 110: 
+                return None
+            print(f"USB Read Error: {e}")
+            return None
+        return None
+    
+    def brom_handshake(self, dev):
+        if self.use_hdlc:
+            return self._hdlc_handshake(dev)
+        else:
+            return self._simple_handshake(dev)
+    
+    def _simple_handshake(self, dev):
+        handshake = bytes.fromhex("7E 00 08 00 00 00 00 00 00 00 7E")
+        try:
+            self.write(dev, handshake)
+            resp = self.read(dev)
+            return resp is not None and len(resp) > 0
+        except Exception:
+            return False
+    
+    def _hdlc_handshake(self, dev):
+        try:
+            frame = HDLCProtocol.encode_frame(HDLCProtocol.CMD.REQ_CONNECT)
+            self.write(dev, frame)
+            resp = self.read(dev, 256, timeout=3000)
+            if resp is None:
+                return False
+            try:
+                cmd, data = HDLCProtocol.decode_frame(bytes(resp))
+                return cmd == HDLCProtocol.CMD.REP_ACK
+            except ValueError as e:
+                print(f"خطأ في فك ترميز HDLC: {e}")
+                return False
+        except Exception as e:
+            print(f"خطأ في مصافحة HDLC: {e}")
+            return False
+    
+    def load_fdl(self, dev, path, addr, xor, progress_callback=None):
+        if self.use_hdlc:
+            return self._hdlc_load_fdl(dev, path, addr, progress_callback)
+        else:
+            return self._simple_load_fdl(dev, path, addr, xor, progress_callback)
+    
+    def _simple_load_fdl(self, dev, path, addr, xor, progress_callback=None):
+        try:
+            total_size = os.path.getsize(path)
+            header = struct.pack("<IIII", 0x01, addr, total_size, xor)
+            self.write(dev, header)
+            ack = self.read(dev)
+            if ack is None or ack[0] != 0x80:
+                return False
+
+            sent = 0
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    self.write(dev, chunk)
+                    if progress_callback:
+                        progress_callback(sent, total_size)
+                    
+                    ack = self.read(dev)
+                    if ack is None or ack[0] != 0x80:
+                        return False
+
+            cmd = struct.pack("<IIII", 0x02, addr, 0x0, 0x0)
+            self.write(dev, cmd)
+            _ = self.read(dev)
+            return True
+        except Exception as e:
+            print(f"Error in simple load FDL: {e}")
+            return False
+    
+    def _hdlc_load_fdl(self, dev, path, addr, progress_callback=None):
+        try:
+            total_size = os.path.getsize(path)
+            
+            start_data = struct.pack("<II", addr, total_size)
+            frame = HDLCProtocol.encode_frame(HDLCProtocol.CMD.REQ_START_DATA, start_data)
+            self.write(dev, frame)
+            
+            resp = self.read(dev, 256)
+            if resp is None:
+                return False
+            
+            cmd, _ = HDLCProtocol.decode_frame(bytes(resp))
+            if cmd != HDLCProtocol.CMD.REP_ACK:
+                return False
+            
+            sent = 0
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(HDLCProtocol.HDLC_DATA_MAX_SIZE)
+                    if not chunk:
+                        break
+                    
+                    sent += len(chunk)
+                    frame = HDLCProtocol.encode_frame(HDLCProtocol.CMD.REQ_MIDST_DATA, chunk)
+                    self.write(dev, frame)
+                    
+                    if progress_callback:
+                        progress_callback(sent, total_size)
+                    
+                    resp = self.read(dev, 256)
+                    if resp is None:
+                        return False
+                    
+                    cmd, _ = HDLCProtocol.decode_frame(bytes(resp))
+                    if cmd != HDLCProtocol.CMD.REP_ACK:
+                        return False
+            
+            frame = HDLCProtocol.encode_frame(HDLCProtocol.CMD.REQ_END_DATA)
+            self.write(dev, frame)
+            
+            resp = self.read(dev, 256)
+            if resp is None:
+                return False
+            
+            cmd, _ = HDLCProtocol.decode_frame(bytes(resp))
+            return cmd == HDLCProtocol.CMD.REP_ACK
+            
+        except Exception as e:
+            print(f"خطأ في تحميل FDL عبر HDLC: {e}")
+            return False
+    
+    def load_fdl1(self, dev, progress_callback=None):
+        if self.use_hdlc:
+            return self._hdlc_load_fdl(dev, FDL1_PATH, 0x55000000, progress_callback)
+        else:
+            return self._simple_load_fdl(dev, FDL1_PATH, 0x55000000, 0x0000000F, progress_callback)
+
+    def load_fdl2(self, dev, progress_callback=None):
+        if self.use_hdlc:
+            return self._hdlc_load_fdl(dev, FDL2_PATH, 0x55080000, progress_callback)
+        else:
+            return self._simple_load_fdl(dev, FDL2_PATH, 0x55080000, 0x0000003B, progress_callback)
+
+    def fdl_cmd(self, dev, cmd, timeout=3000):
+        try:
+            if self.use_hdlc:
+                packet = struct.pack("<I", cmd)
+                frame = HDLCProtocol.encode_frame(HDLCProtocol.CMD.REQ_EXEC_DATA, packet)
+                self.write(dev, frame)
+            else:
+                packet = struct.pack("<I", cmd)
+                self.write(dev, packet)
+            
+            start = time.time()
+            while time.time() - start < timeout / 1000.0:
+                resp = self.read(dev, 256)
+                if resp:
+                    if self.use_hdlc:
+                        try:
+                            cmd_type, data = HDLCProtocol.decode_frame(bytes(resp))
+                            return data if data else bytes(resp)
+                        except:
+                            return bytes(resp)
+                    else:
+                        return bytes(resp)
+                time.sleep(0.01)
+            return None
+        except Exception:
+            return None
+
+    def get_device_info(self, dev):
+        info = {}
+        resp = self.fdl_cmd(dev, 0xA0)
+        if resp:
+            info["chip_info"] = resp.hex()
+        resp = self.fdl_cmd(dev, 0xA1)
+        if resp:
+            info["flash_info"] = resp.hex()
+        resp = self.fdl_cmd(dev, 0xA2)
+        if resp:
+            info["security_info"] = resp.hex()
+        return info
+
+    def smart_format(self, dev):
+        resp = self.fdl_cmd(dev, 0xD5)
+        if resp is None:
+            resp = self.fdl_cmd(dev, 0xD4)
+            if resp is None:
+                return False
+        return True
+
+    def exit_and_reboot(self, dev):
+        reboot_info = []
+        try:
+            exit_packet = RebootPackets.REBOOT_PACKETS["exit_fdl"]
+            self.write(dev, exit_packet)
+            reboot_info.append({
+                "name": "Exit FDL",
+                "hex": exit_packet.hex(),
+                "command": "0xB2",
+                "description": "الخروج من وضع FDL"
+            })
+            time.sleep(1)
+            
+            reboot_packet = RebootPackets.REBOOT_PACKETS["soft_reboot"]
+            self.write(dev, reboot_packet)
+            reboot_info.append({
+                "name": "Soft Reboot",
+                "hex": reboot_packet.hex(),
+                "command": "0xB1",
+                "description": "إعادة التشغيل الناعمة"
+            })
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error during exit_and_reboot: {e}")
+        return reboot_info
+    
+    def send_custom_reboot(self, dev, packet_type: str):
+        return RebootPackets.send_reboot_packet(dev, packet_type, self)
+
+
+# ==============================================================================
+# SECTION 5: WORKER (THREADING)
+# ==============================================================================
+class Worker(QObject):
+    log_signal = Signal(str)
+    packet_signal = Signal(dict)
+    finished = Signal()
+    progress_signal = Signal(int) # New signal for progress percentage (0-100)
+    
+    def __init__(self, task, use_hdlc=False, *args, kwargs):
+        super().__init__()
+        self.task = task
+        self.use_hdlc = use_hdlc
+        self.args = args
+        self.kwargs = kwargs
+        self._usb = None 
+
+    def run(self):
+        try:
+            self._usb = UnisocUSB(use_hdlc=self.use_hdlc)
+            
+            if self.task == "death_of_tab":
+                self._death_of_tab()
+            elif self.task == "specify_protection":
+                self._specify_protection()
+            elif self.task == "conversion_to_fdl":
+                self._conversion_to_fdl()
+            elif self.task == "device_info":
+                self._device_info()
+            elif self.task == "format_run":
+                self._format_run()
+            elif self.task == "send_reboot_packet":
+                packet_name = self.args[0] if self.args else "soft_reboot"
+                self._send_reboot_packet(packet_name)
+        except Exception as e:
+            self.log_signal.emit(f"Error: {e}")
+        finally:
+            self.finished.emit()
+
+    def _death_of_tab(self):
+        protocol_name = "HDLC" if self.use_hdlc else "البسيط"
+        self.log_signal.emit(f"استخدام بروتوكول {protocol_name}")
+        self.log_signal.emit("إرسال أمر إيقاف التشغيل...")
+        time.sleep(1)
+        self.log_signal.emit("يرجى فصل الجهاز ثم إعادة وصله.")
+        self.log_signal.emit("انتظار الجهاز في وضع BROM...")
+        self.progress_signal.emit(10)
+
+        for attempt in range(60):
+            dev = UnisocUSB.find_device()
+            if dev is not None:
+                self.log_signal.emit(f"تم العثور على الجهاز (المحاولة {attempt+1}). جار المصافحة...")
+                dev = UnisocUSB.connect(dev)
+                if dev is not None and self._usb.brom_handshake(dev):
+                    self.log_signal.emit(f"المصافحة ناجحة.")
+                    self.progress_signal.emit(100)
+                    return
+                else:
+                    self.log_signal.emit("فشلت المصافحة، إعادة المحاولة...")
+            self.progress_signal.emit(int((attempt+1)/60 * 50)) # 0 to 50%
+            time.sleep(1)
+        self.log_signal.emit("انتهى الوقت: فشل اكتشاف الجهاز في وضع BROM.")
+
+    def _specify_protection(self):
+        pass
+
+    def _conversion_to_fdl(self):
+        usb = self._usb
+        protocol_name = "HDLC" if self.use_hdlc else "البسيط"
+        self.log_signal.emit(f"استخدام بروتوكول {protocol_name} للتحويل إلى وضع FDL")
+        self.progress_signal.emit(0)
+        
+        dev = UnisocUSB.find_device()
+        if dev is None:
+            self.log_signal.emit("الجهاز غير موجود. تأكد أنه في وضع BROM.")
+            return
+        dev = UnisocUSB.connect(dev)
+        if dev is None:
+            self.log_signal.emit("فشل الاتصال بالجهاز.")
+            return
+        self.log_signal.emit("تم الاتصال بجهاز BROM.")
+        self.progress_signal.emit(10)
+
+        if not os.path.exists(FDL1_PATH):
+            self.log_signal.emit(f"ملف FDL1 غير موجود في {FDL1_PATH}")
+            return
+        if not os.path.exists(FDL2_PATH):
+            self.log_signal.emit(f"ملف FDL2 غير موجود في {FDL2_PATH}")
+            return
+
+        self.log_signal.emit("جار تنفيذ مصافحة BROM...")
+        if not usb.brom_handshake(dev):
+            self.log_signal.emit("فشلت المصافحة. الإلغاء.")
+            return
+        self.progress_signal.emit(20)
+
+        def progress_cb1(sent, total):
+            if total > 0:
+                percent = 20 + int((sent / total) * 30)
+                self.progress_signal.emit(percent)
+
+        self.log_signal.emit("جار تحميل FDL1...")
+        if not usb.load_fdl1(dev, progress_callback=progress_cb1):
+            self.log_signal.emit("فشل تحميل FDL1.")
+            return
+        self.log_signal.emit("تم تحميل FDL1، انتظار إعادة التشغيل...")
+        self.progress_signal.emit(50)
+        time.sleep(5)
+
+        self.log_signal.emit("جار إعادة الاتصال...")
+        self.progress_signal.emit(60)
+        dev = None
+        for i in range(10):
+            dev = UnisocUSB.find_device()
+            if dev:
+                break
+            time.sleep(1)
+        if dev is None:
+            self.log_signal.emit("الجهاز غير موجود بعد إعادة التشغيل.")
+            return
+        dev = UnisocUSB.connect(dev)
+        self.log_signal.emit("تم الاتصال مرة أخرى.")
+        self.progress_signal.emit(70)
+
+        def progress_cb2(sent, total):
+            if total > 0:
+                percent = 70 + int((sent / total) * 30)
+                self.progress_signal.emit(percent)
+
+        self.log_signal.emit("جار تحميل FDL2...")
+        if not usb.load_fdl2(dev, progress_callback=progress_cb2):
+            self.log_signal.emit("فشل تحميل FDL2.")
+            return
+        self.log_signal.emit("تم تحميل FDL2، الجهاز الآن في وضع FDL.")
+        self.progress_signal.emit(100)
+
+    def _device_info(self):
+        usb = self._usb
+        protocol_name = "HDLC" if self.use_hdlc else "البسيط"
+        self.log_signal.emit(f"استخدام بروتوكول {protocol_name} لقراءة معلومات الجهاز")
+        
+        dev = UnisocUSB.find_device()
+        if dev is None:
+            self.log_signal.emit("الجهاز غير موجود. تأكد أنه في وضع FDL.")
+            return
+        dev = UnisocUSB.connect(dev)
+        if dev is None:
+            self.log_signal.emit("فشل الاتصال.")
+            return
+        self.log_signal.emit("جار قراءة معلومات الجهاز...")
+        self.progress_signal.emit(50)
+        info = usb.get_device_info(dev)
+        if not info:
+            self.log_signal.emit("لم يتم استقبال أي معلومات.")
+        else:
+            self.log_signal.emit("=== معلومات الجهاز ===")
+            for key, value in info.items():
+                self.log_signal.emit(f"{key}: {value}")
+        self.progress_signal.emit(100)
+
+    def _format_run(self):
+        usb = self._usb
+        protocol_name = "HDLC" if self.use_hdlc else "البسيط"
+        self.log_signal.emit(f"استخدام بروتوكول {protocol_name} للتهيئة")
+        
+        dev = UnisocUSB.find_device()
+        if dev is None:
+            self.log_signal.emit("الجهاز غير موجود. تأكد أنه في وضع FDL.")
+            return
+        dev = UnisocUSB.connect(dev)
+        if dev is None:
+            self.log_signal.emit("فشل الاتصال.")
+            return
+        self.log_signal.emit("محاولة التهيئة...")
+        self.progress_signal.emit(30)
+        
+        if usb.smart_format(dev):
+            self.log_signal.emit("تمت التهيئة بنجاح.")
+        else:
+            self.log_signal.emit("فشلت التهيئة.")
+        
+        self.progress_signal.emit(60)
+        self.log_signal.emit("الخروج من وضع FDL وإعادة التشغيل...")
+        self.log_signal.emit("جار إرسال حزم إعادة التشغيل...")
+        
+        reboot_info = usb.exit_and_reboot(dev)
+        
+        for packet in reboot_info:
+            self.packet_signal.emit(packet)
+            self.log_signal.emit(f"تم إرسال: {packet['name']} - Hex: {packet['hex']}")
+        
+        self.log_signal.emit("تم إرسال جميع حزم إعادة التشغيل.")
+        self.progress_signal.emit(100)
+
+    def _send_reboot_packet(self, packet_name: str):
+        usb = self._usb
+        
+        dev = UnisocUSB.find_device()
+        if dev is None:
+            self.log_signal.emit("الجهاز غير موجود. تأكد أنه في وضع FDL/BROM.")
+            return
+        
+        dev = UnisocUSB.connect(dev)
+        if dev is None:
+            self.log_signal.emit("فشل الاتصال.")
+            return
+        
+        self.log_signal.emit(f"جار إرسال حزمة: {packet_name}")
+        
+        packet_bytes = RebootPackets.get_packet_bytes(packet_name)
+        if not packet_bytes:
+            self.log_signal.emit(f"الحزمة '{packet_name}' غير موجودة.")
+            return
+        
+        self.log_signal.emit(f"Hex: {packet_bytes.hex()}")
+        self.progress_signal.emit(50)
+        
+        if usb.send_custom_reboot(dev, packet_name):
+            self.log_signal.emit(f"تم إرسال حزمة {packet_name} بنجاح.")
+        else:
+            self.log_signal.emit(f"فشل إرسال حزمة {packet_name}.")
+        
+        self.progress_signal.emit(100)
+
+
+# ==============================================================================
+# SECTION 6: UI DIALOGS
+# ==============================================================================
+class DiagramDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Specify Protection - Diagram")
+        self.setFixedSize(400, 250)
+        layout = QVBoxLayout(self)
+
+        svg_widget = QSvgWidget()
+        svg_data = """
+<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="50" y="20" width="300" height="30" fill="lightblue" stroke="black"/>
+  <text x="200" y="40" text-anchor="middle" font-family="Arial" font-size="14">Settings</text>
+  <line x1="200" y1="50" x2="200" y2="80" stroke="black"/>
+  <rect x="50" y="80" width="300" height="30" fill="lightgreen" stroke="black"/>
+  <text x="200" y="100" text-anchor="middle" font-family="Arial" font-size="14">About Phone</text>
+  <line x1="200" y1="110" x2="200" y2="140" stroke="black"/>
+  <rect x="50" y="140" width="300" height="30" fill="lightyellow" stroke="black"/>
+  <text x="200" y="160" text-anchor="middle" font-family="Arial" font-size="14">Build Number</text>
+</svg>
+"""
+        svg_widget.load(svg_data.encode())
+        layout.addWidget(svg_widget)
+
+        QTimer.singleShot(9000, self.accept)
+
+
+# ==============================================================================
+# SECTION 7: MAIN WINDOW (GUI)
+# ==============================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SPD Tool - Final Organized Version - by yousef ekramy")
+        self.setMinimumSize(1000, 750)
+        self.current_worker = None
+        self.use_hdlc = False
+        self.reboot_buttons = [] 
+
+        self.setup_ui()
+        self.setup_signals()
+        self.setStyleSheet(self.get_stylesheet())
+        self.refresh_devices()
+
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # إعدادات البروتوكول
+        protocol_group = QGroupBox("إعدادات البروتوكول")
+        protocol_layout = QVBoxLayout()
+        self.hdlc_checkbox = QCheckBox("استخدام بروتوكول HDLC (متقدم)")
+        protocol_layout.addWidget(self.hdlc_checkbox)
+        
+        protocol_info = QLabel("• البروتوكول البسيط: أسرع، يعمل مع معظم الأجهزة\n"
+                              "• بروتوكول HDLC: أكثر موثوقية، يدعم CRC")
+        protocol_info.setStyleSheet("color: #aaa; font-size: 10pt;")
+        protocol_info.setWordWrap(True)
+        protocol_layout.addWidget(protocol_info)
+        protocol_group.setLayout(protocol_layout)
+        main_layout.addWidget(protocol_group)
+
+        # Tabs
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # ----- Tab 1: Operations -----
+        tab1 = QWidget()
+        tab1_layout = QVBoxLayout(tab1)
+        
+        # قسم العمليات الأساسية
+        basic_group = QGroupBox("العمليات الأساسية")
+        basic_layout = QVBoxLayout()
+        self.btn_death = QPushButton("Death of the Tab")
+        self.btn_spec = QPushButton("Specify the type of protection")
+        self.btn_fdl = QPushButton("Conversion to FDL mode")
+        self.btn_info = QPushButton("Device information")
+        self.btn_format = QPushButton("Format and run")
+        
+        basic_layout.addWidget(self.btn_death)
+        basic_layout.addWidget(self.btn_spec)
+        basic_layout.addWidget(self.btn_fdl)
+        basic_layout.addWidget(self.btn_info)
+        basic_layout.addWidget(self.btn_format)
+        basic_group.setLayout(basic_layout)
+        tab1_layout.addWidget(basic_group)
+        
+        # قسم حزم إعادة التشغيل - Dynamic Buttons
+        reboot_group = QGroupBox("أوامر إعادة التشغيل (اضغط لتنفيذ الأمر)")
+        reboot_layout = QVBoxLayout()
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        
+        all_packets = RebootPackets.get_all_packets()
+        
+        for category, packets in all_packets.items():
+            cat_label = QLabel(f"<b>{category}</b>")
+            cat_label.setStyleSheet("color: #007acc; margin-top: 10px;")
+            scroll_layout.addWidget(cat_label)
+            
+            for packet_id, packet_info in packets.items():
+                btn = QPushButton(packet_info['description'])
+                btn.setToolTip(f"Hex: {packet_info['hex']}\nUsage: {packet_info['usage']}")
+                btn.clicked.connect(lambda checked, pid=packet_id: self.send_reboot_packet(pid))
+                
+                scroll_layout.addWidget(btn)
+                self.reboot_buttons.append(btn)
+        
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        reboot_layout.addWidget(scroll)
+        
+        reboot_group.setLayout(reboot_layout)
+        tab1_layout.addWidget(reboot_group)
+        
+        tab1_layout.addStretch()
+
+        # ----- Tab 2: About -----
+        tab2 = QWidget()
+        tab2_layout = QVBoxLayout(tab2)
+        label_about = QLabel("المطور: yousef ekramy\n\n"
+                            "الإصدار: 2.5 Final\n\n"
+                            "مميزات الإصدار:\n"
+                            "1. الكود منظم في أقسام واضحة\n"
+                            "2. شريط تقدم (Progress Bar) للعمليات\n"
+                            "3. أزرار ديناميكية لكل حزمة\n"
+                            "4. دعم بروتوكول HDLC\n"
+                            "5. تتبع دقيق لحالة التحميل")
+        label_about.setAlignment(Qt.AlignCenter)
+        label_about.setStyleSheet("font-size: 14px;")
+        label_about.setWordWrap(True)
+        tab2_layout.addStretch()
+        tab2_layout.addWidget(label_about)
+        self.btn_youtube = QPushButton("قناة اليوتيوب")
+        tab2_layout.addWidget(self.btn_youtube)
+        tab2_layout.addStretch()
+
+        self.tabs.addTab(tab1, "العمليات")
+        self.tabs.addTab(tab2, "حول")
+
+        # Device list and log area
+        splitter = QSplitter(Qt.Horizontal)
+        
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(QLabel("الأجهزة المتصلة"))
+        self.device_list = QListWidget()
+        left_layout.addWidget(self.device_list)
+        self.btn_refresh = QPushButton("تحديث")
+        left_layout.addWidget(self.btn_refresh)
+        
+        sent_packets_label = QLabel("الحزم المرسلة حديثاً:")
+        sent_packets_label.setStyleSheet("margin-top: 20px; font-weight: bold;")
+        left_layout.addWidget(sent_packets_label)
+        
+        self.sent_packets_list = QListWidget()
+        self.sent_packets_list.setMaximumHeight(150)
+        left_layout.addWidget(self.sent_packets_list)
+        
+        splitter.addWidget(left_widget)
+        
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.addWidget(QLabel("سجل العمليات"))
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        self.progress_bar.setStyleSheet("QProgressBar { border: 1px solid grey; border-radius: 5px; text-align: center; } QProgressBar::chunk { background-color: #007acc; }")
+        right_layout.addWidget(self.progress_bar)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFontFamily("Courier New")
+        self.log_text.setFontPointSize(10)
+        right_layout.addWidget(self.log_text, 2)
+        splitter.addWidget(right_widget)
+        
+        splitter.setSizes([300, 700])
+        main_layout.addWidget(splitter, 1)
+
+        self.statusBar = self.statusBar()
+        self.statusBar.showMessage("جاهز")
+
+    def setup_signals(self):
+        self.btn_death.clicked.connect(self.on_death)
+        self.btn_spec.clicked.connect(self.on_spec)
+        self.btn_fdl.clicked.connect(self.on_fdl)
+        self.btn_info.clicked.connect(self.on_info)
+        self.btn_format.clicked.connect(self.on_format)
+        self.btn_refresh.clicked.connect(self.refresh_devices)
+        self.btn_youtube.clicked.connect(self.open_youtube)
+        self.hdlc_checkbox.stateChanged.connect(self.on_hdlc_changed)
+
+    def on_hdlc_changed(self, state):
+        self.use_hdlc = (state == Qt.Checked)
+        protocol = "HDLC" if self.use_hdlc else "البسيط"
+        self.log(f"تم تغيير البروتوكول إلى: {protocol}")
+
+    def get_stylesheet(self):
+        return """
+        QMainWindow { background-color: #2b2b2b; color: #ffffff; }
+        QGroupBox { border: 2px solid #007acc; border-radius: 5px; margin-top: 10px; font-weight: bold; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px 0 5px; color: #007acc; }
+        QTabWidget::pane { border: 1px solid #444; background: #2b2b2b; }
+        QTabBar::tab { background: #444; color: #fff; padding: 8px; border: 1px solid #555; }
+        QTabBar::tab:selected { background: #007acc; }
+        QPushButton { background-color: #007acc; color: white; border: none; padding: 8px 16px; border-radius: 4px; margin: 2px; }
+        QPushButton:hover { background-color: #0099ff; }
+        QPushButton:disabled { background-color: #555; }
+        QTextEdit { background-color: #1e1e1e; color: #dcdcdc; font-family: Consolas, monospace; }
+        QListWidget { background-color: #1e1e1e; color: #dcdcdc; }
+        QLabel { color: #ffffff; }
+        QCheckBox { color: #ffffff; padding: 5px; }
+        QCheckBox::indicator { width: 18px; height: 18px; }
+        QSplitter::handle { background-color: #444; }
+        QScrollArea { border: none; background-color: #2b2b2b; }
+        QProgressBar { color: white; }
+        """
+
+    @Slot(str)
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+    
+    @Slot(dict)
+    def add_sent_packet(self, packet_info):
+        display_text = f"{packet_info['name']}: {packet_info['hex']}"
+        self.sent_packets_list.addItem(display_text)
+        self.sent_packets_list.setCurrentRow(self.sent_packets_list.count() - 1)
+        if self.sent_packets_list.count() > 10:
+            self.sent_packets_list.takeItem(0)
+            
+    @Slot(int)
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+
+    def refresh_devices(self):
+        self.device_list.clear()
+        devs = usb.core.find(find_all=True, idVendor=VID, idProduct=PID)
+        count = 0
+        for dev in devs:
+            count += 1
+            self.device_list.addItem(
+                f"الجهاز {count} (Bus {dev.bus}, Address {dev.address})"
+            )
+        if count == 0:
+            self.device_list.addItem("لم يتم العثور على أجهزة SPD (VID 0x1782, PID 0x4D00)")
+        else:
+            self.log(f"تم العثور على {count} جهاز(أجهزة)")
+
+    def open_youtube(self):
+        import webbrowser
+        webbrowser.open("https://www.youtube.com")
+
+    def disable_buttons(self, state=True):
+        self.btn_death.setDisabled(state)
+        self.btn_spec.setDisabled(state)
+        self.btn_fdl.setDisabled(state)
+        self.btn_info.setDisabled(state)
+        self.btn_format.setDisabled(state)
+        self.btn_refresh.setDisabled(state)
+        self.hdlc_checkbox.setDisabled(state)
+        for btn in self.reboot_buttons:
+            btn.setDisabled(state)
+
+    def enable_buttons(self):
+        self.disable_buttons(False)
+
+    def start_worker(self, task, *args):
+        if self.current_worker is not None:
+            self.log("هناك عملية أخرى قيد التشغيل بالفعل.")
+            return
+        
+        self.disable_buttons()
+        protocol_name = "HDLC" if self.use_hdlc else "البسيط"
+        self.log(f"بدء العملية: {task} باستخدام بروتوكول {protocol_name}")
+        self.progress_bar.setValue(0) # Reset progress
+        
+        self.thread = QThread()
+        self.worker = Worker(task, self.use_hdlc, *args)
+        self.worker.moveToThread(self.thread)
+        self.worker.log_signal.connect(self.log)
+        self.worker.packet_signal.connect(self.add_sent_packet)
+        self.worker.progress_signal.connect(self.update_progress) # Connect progress
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.on_worker_finished)
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+        self.current_worker = self.worker
+
+    def on_worker_finished(self):
+        self.enable_buttons()
+        self.current_worker = None
+        self.progress_bar.setValue(100) # Ensure full progress at end
+        self.statusBar.showMessage("اكتملت العملية.")
+
+    def on_death(self):
+        QTimer.singleShot(0, lambda: self._show_death_message())
+
+    def _show_death_message(self):
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("تحذير")
+        msg.setText("هذه العملية ستوقف تشغيل الجهاز. لا تفصل الجهاز حتى يتم إعلامك.")
+        msg.setStandardButtons(QMessageBox.Ok)
+        ret = msg.exec()
+        if ret == QMessageBox.Ok:
+            self._after_death_warning()
+
+    def _after_death_warning(self):
+        self.log("تم عرض التحذير. الرجاء اتباع التعليمات.")
+        instr = QMessageBox(self)
+        instr.setIcon(QMessageBox.Information)
+        instr.setWindowTitle("تعليمات")
+        instr.setText("الرجاء فصل الجهاز ثم إعادة وصله.")
+        instr.setStandardButtons(QMessageBox.Ok)
+        ret = instr.exec()
+        if ret == QMessageBox.Ok:
+            self.start_worker("death_of_tab")
+
+    def on_spec(self):
+        dlg = DiagramDialog(self)
+        dlg.setWindowTitle("Specify Protection")
+        dlg.exec()
+        self.start_worker("specify_protection")
+
+    def on_fdl(self):
+        self.start_worker("conversion_to_fdl")
+
+    def on_info(self):
+        self.start_worker("device_info")
+
+    def on_format(self):
+        self.start_worker("format_run")
+    
+    def send_reboot_packet(self, packet_name: str):
+        packet_bytes = RebootPackets.get_packet_bytes(packet_name)
+        packet_info = None
+        
+        all_packets = RebootPackets.get_all_packets()
+        for category, packets in all_packets.items():
+            for pid, info in packets.items():
+                if info.get('hex', '').replace(' ', '') == packet_bytes.hex():
+                    packet_info = {
+                        'name': info['description'],
+                        'hex': packet_bytes.hex(),
+                        'command': info['command'],
+                        'description': info['usage']
+                    }
+                    break
+        
+        if packet_info:
+            self.add_sent_packet(packet_info)
+            self.start_worker("send_reboot_packet", packet_name)
+        else:
+            self.log(f"الحزمة {packet_name} غير معروفة")
+
+
+# ==============================================================================
+# SECTION 8: ENTRY POINT
+# ==============================================================================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    app.setStyle("Fusion")
+    
+    if not os.path.exists(FDL1_PATH):
+        print(f"تحذير: ملف FDL1 غير موجود في {FDL1_PATH}")
+        print("الرجاء وضع ملف FDL1.bin في مجلد 'volcano'")
+    
+    if not os.path.exists(FDL2_PATH):
+        print(f"تحذير: ملف FDL2 غير موجود في {FDL2_PATH}")
+        print("الرجاء وضع ملف FDL2.bin في مجلد 'volcano'")
+    
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
